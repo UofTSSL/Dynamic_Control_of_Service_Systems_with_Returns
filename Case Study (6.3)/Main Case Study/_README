@@ -1,0 +1,6 @@
+Main case study: 
+- case_pickle_policy to generate pickles which cache the policies
+- case_sim_eq and case_sim_trans to simulate long-run and transient, respectively.
+
+Output files in data
+Figures in plots, produced by the notebook

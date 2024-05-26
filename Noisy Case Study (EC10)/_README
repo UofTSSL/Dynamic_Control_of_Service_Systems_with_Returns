@@ -1,0 +1,6 @@
+Noisy case study:
+- case_sim_trans_optimistic.py
+- case_sim_eq_optimistic.py
+
+Output files in data/noisy_case_combined_optimistic
+Plots are produced by the notebook

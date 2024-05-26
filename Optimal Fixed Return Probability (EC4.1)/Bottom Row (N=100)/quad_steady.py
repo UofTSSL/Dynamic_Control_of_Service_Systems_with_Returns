@@ -1,0 +1,371 @@
+import SimFunctions
+import SimRNG 
+import SimClasses
+import numpy as np
+import scipy.stats as stats
+from scipy import optimize, integrate
+import matplotlib.pyplot as plt
+from datetime import datetime
+import pandas as pd
+from itertools import product
+from sklearn.neighbors import KNeighborsRegressor
+import math
+
+# Change to the directory you want the ouput to be saved in
+directory = "outputs_quad_steady\\"
+log_file = "sims.log"
+
+
+T_MAX = 365
+MAX_STEP = 0.02
+
+
+class Experiment:
+    
+    def R(self, p):
+        return self.arrival_rate / ((1-p) * self.service_rate)
+    
+    def c(self, p):
+        _R = self.R(p)
+        res_sum = (_R ** self.server_num) / (math.factorial(self.server_num) * (1-_R/self.server_num))
+        for i in range(self.server_num):
+            res_sum += (_R ** i) / math.factorial(i)
+        return 1/res_sum
+    
+    def prob_of_waiting(self, p):
+        _R = self.R(p)
+        return (_R ** self.server_num) * self.c(p) / (math.factorial(self.server_num) * (1-_R/self.server_num))
+    
+    def expected_wait(self, p):
+        return self.prob_of_waiting(p) / (self.service_rate * self.server_num / (1-p))
+
+    def g1(self, s):
+        return self.hold_cost * s + (self.return_cost * self.p_eq + self.interv_cost(self.p_eq)) / (1 - self.p_eq)
+
+    def g2(self, s):
+        return self.hold_cost / self.return_rate * \
+               (np.exp(-self.return_rate * s) + self.return_rate * s - 1) + (self.return_cost + self.interv_cost(self.p_eq)) / (1 - self.p_eq)
+
+    def p(self, tau):
+        return optimize.minimize_scalar(
+            lambda q: self.interv_cost(q) + self.g2(tau) * q,
+            bounds=(self.p_l, self.p_h), method="bounded"
+        ).x
+
+    def pol(self, costate):
+        return optimize.minimize_scalar(
+            lambda q: self.interv_cost(q) + costate * q,
+            bounds=(self.p_l, self.p_h), method="bounded"
+        ).x
+
+    def y_coef(self, tau):
+        return self.hold_cost * (1 - np.exp(-self.return_rate * tau))
+
+    def const(self, tau):
+        prob = self.p(tau)
+        return -self.J_eq + (self.arrival_rate - self.service_rate * self.server_num) * self.g1(tau) \
+               + self.service_rate * self.server_num * (self.interv_cost(prob) + self.g2(tau) * prob)
+
+    def eq_policy(self, x, y):
+        return self.p_eq
+
+    def jackson_policy(self, x, y):
+        return self.p_jackson
+
+    def simple_policy(self, x, y):
+        if x < self.server_num:
+            return self.p_eq
+        return self.p_l
+
+
+    def __init__(self, **kwargs):
+
+        self.params = kwargs
+
+        self.reps = kwargs.get("reps", 100)
+        self.run_length = kwargs.get("run_length", 365)
+        self.warm_up = kwargs.get("warm_up", 0)#1000)
+        self.metrics = [[], [], []]
+
+        self.server_num = kwargs.get('N', 50)
+        self.arrival_rate = kwargs.get('lambda', 9.5)
+        self.mean_tba = 1 / self.arrival_rate
+        self.return_rate = kwargs.get('nu', 1/15)
+        self.mean_ttr = 1 / self.return_rate
+        self.service_rate = kwargs.get('mu', 1/4)
+        self.mean_st = 1 / self.service_rate
+        self.p_h = kwargs.get('p_h', 0.2)
+        self.p_l = kwargs.get('p_l', 0.1)
+
+        self.fluctuation = kwargs.get('fluctuation', 0)
+        self.period = kwargs.get('period', 1)
+
+        self.hold_cost = kwargs.get('h', 0.2)
+        self.return_cost = kwargs.get('r', 1.0)
+
+        self.interv_cost_str = kwargs.get('C', "lambda p: 10 * 1.0 * (0.2-p)")
+        self.interv_cost = eval(self.interv_cost_str)
+
+        self.x_0 = kwargs.get('x_0', 75)
+        self.y_0 = kwargs.get('y_0', 75)
+        self.scale = kwargs.get('scale', 50)
+
+        self.p_eq = optimize.minimize_scalar(
+            lambda p: (self.return_cost * p + self.interv_cost(p)) / (1 - p),
+            bounds=(self.p_l, self.p_h), method="bounded"
+        ).x
+        self.p_jackson = optimize.minimize_scalar(
+            lambda p: (self.return_cost * p + self.interv_cost(p) + self.expected_wait(p) * self.hold_cost) / (1 - p),
+            bounds=(self.p_l, self.p_h), method="bounded"
+        ).x
+        self.J_eq = self.arrival_rate * (self.return_cost * self.p_eq + self.interv_cost(self.p_eq)) / (1 - self.p_eq)
+        self.g1_eq = (self.return_cost * self.p_eq + self.interv_cost(self.p_eq)) / (1 - self.p_eq)
+        self.g2_eq = (self.return_cost + self.interv_cost(self.p_eq)) / (1 - self.p_eq)
+
+        self.policy_variants = [self.eq_policy, self.jackson_policy]
+
+
+    def run(self):
+        for j, pol in enumerate(self.policy_variants):
+            SimRNG.InitializeRNSeed()
+            for i in range(self.reps):
+                print(datetime.now(), i)
+                sim = Simulation(self, policy=pol)
+                results = sim.simulate(stream=0)
+                print(datetime.now(), i)
+                self.metrics[j].append(list(results))
+
+    def save(self):
+        timestamp = datetime.now()
+        time_str = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        path = directory + "simulation_" + time_str + ".csv"
+        headers = ['h_cost', 'r_cost', 'C_cost', 'total_cost', 'mean_p', 'mean_wait', 'mean_queue', 'mean_orbit', 'mean_server', 'x_T', 'y_T', 'mean_p_time', 'mean_congested_time']
+        eq_frame = pd.DataFrame(self.metrics[0], columns=headers)
+        simple_frame = pd.DataFrame(self.metrics[1], columns=headers)
+        opt_frame = pd.DataFrame(self.metrics[2], columns=headers)
+        frame = pd.concat([eq_frame, simple_frame, opt_frame], axis=1)
+        frame.to_csv(path)
+
+        file = open(directory + log_file, "a")
+        file.write("\n" + time_str + "," + str(self.params))
+        file.close()
+
+
+
+# Given reference point i, use the following streams for RNGs
+# i+1: External arrivals ~Exp(Lambda)
+# i+2: Service times ~Exp(mu)
+# i+3: Return times ~Exp(nu)
+# i+4: Returns ~Bernoulli(p)
+
+class Simulation:
+
+    def __init__(self, experiment, warm_up=0, **kwargs):
+        self.experiment = experiment
+        self.policy = kwargs.get("policy", lambda x, y : experiment.p_h)
+        self.stream = 1
+
+        self.queue = SimClasses.FIFOQueue()
+        self.wait_stat = SimClasses.DTStat()
+        self.interv_stat = SimClasses.DTStat()
+        self.interv_cost_stat = SimClasses.DTStat()
+        self.returns_stat = SimClasses.DTStat()
+        self.congestion_stat = SimClasses.CTStat()
+        self.orbit_stat = SimClasses.CTStat()
+        self.server = SimClasses.Resource()
+        self.server.SetUnits(self.experiment.server_num * self.experiment.scale // 50)
+        self.calendar = SimClasses.EventCalendar()
+
+        self.is_congested_stat = SimClasses.CTStat()
+        self.is_intervening_stat = SimClasses.CTStat()
+
+        self.X = self.experiment.x_0 * self.experiment.scale // 50
+        self.Y = self.experiment.y_0 * self.experiment.scale // 50
+
+        self.ct_stats = []
+        self.dt_stats = []
+        self.queues = []
+        self.resources = []
+
+        self.dt_stats.append(self.interv_stat)
+        self.dt_stats.append(self.interv_cost_stat)
+        self.dt_stats.append(self.returns_stat)
+        self.ct_stats.append(self.congestion_stat)
+        self.ct_stats.append(self.orbit_stat)
+
+        self.ct_stats.append(self.is_congested_stat)
+        self.ct_stats.append(self.is_intervening_stat)
+
+        self.queues.append(self.queue)
+        self.resources.append(self.server)
+
+    def NSPP(self):
+        PossibleArrival = SimClasses.Clock + SimRNG.Expon(self.experiment.mean_tba / (1 + self.experiment.fluctuation) / self.experiment.scale * 50, self.stream)
+        while SimRNG.Uniform(0, 1, self.stream) >= (1.0 + self.experiment.fluctuation * np.sin(2*np.pi * PossibleArrival / self.experiment.period)) / (1.0 + self.experiment.fluctuation):
+            PossibleArrival = PossibleArrival + SimRNG.Expon(self.experiment.mean_tba / (1 + self.experiment.fluctuation) / self.experiment.scale * 50, self.stream)
+        nspp = PossibleArrival - SimClasses.Clock
+        return nspp
+
+    def Arrival(self):
+        SimFunctions.Schedule(self.calendar, "Arrival", self.NSPP())
+        # SimFunctions.Schedule(self.calendar,"Arrival",SimRNG.Expon(self.experiment.mean_tba/self.experiment.scale*50, self.stream))
+        # SimFunctions.Schedule(self.calendar,"Arrival",SimRNG.Expon(self.experiment.mean_tba/self.experiment.scale*50, self.stream+1))
+        customer = SimClasses.Entity()
+        self.queue.Add(customer)
+
+        self.X += 1
+        self.congestion_stat.Record(max(self.X-self.experiment.server_num*self.experiment.scale/50, 0))
+        self.is_congested_stat.Record(1 if self.X > self.experiment.server_num*self.experiment.scale/50 else 0)
+        self.is_intervening_stat.Record(self.policy(self.X * 50 / self.experiment.scale, self.Y * 50 / self.experiment.scale))
+
+        if self.server.Busy < self.experiment.server_num * self.experiment.scale/50:
+            self.server.Seize(1)
+            SimFunctions.Schedule(self.calendar, "EndOfService", SimRNG.Expon(self.experiment.mean_st, self.stream))
+            # SimFunctions.Schedule(self.calendar,"EndOfService",SimRNG.Expon(self.experiment.mean_st,self.stream+2))
+
+    def EndOfService(self):
+        DepartingCustomer = self.queue.Remove()
+        self.wait_stat.Record(SimClasses.Clock - DepartingCustomer.CreateTime)
+        # if there are customers waiting
+        if self.queue.NumQueue() >= self.experiment.server_num * self.experiment.scale/50:
+            SimFunctions.Schedule(self.calendar, "EndOfService", SimRNG.Expon(self.experiment.mean_st, self.stream))
+            # SimFunctions.Schedule(self.calendar,"EndOfService",SimRNG.Expon(self.experiment.mean_st,self.stream+2))
+        else:
+            self.server.Free(1)
+
+        p = self.policy(self.X * 50 / self.experiment.scale, self.Y * 50 / self.experiment.scale)
+        self.interv_stat.Record(p)
+        self.interv_cost_stat.Record(self.experiment.interv_cost(p))
+        # if SimRNG.Uniform(0,1,self.stream+4) < p:
+        if SimRNG.Uniform(0, 1, self.stream) < p:
+            self.Y += 1
+            self.orbit_stat.Record(self.Y)
+            SimFunctions.Schedule(self.calendar, "Return", SimRNG.Expon(self.experiment.mean_ttr, self.stream))
+            # SimFunctions.Schedule(self.calendar,"Return",SimRNG.Expon(self.experiment.mean_ttr, self.stream+3))
+
+        self.X -= 1
+        self.congestion_stat.Record(max(self.X - self.experiment.server_num * self.experiment.scale/50, 0))
+        self.is_congested_stat.Record(1 if self.X > self.experiment.server_num*self.experiment.scale/50 else 0)
+        self.is_intervening_stat.Record(self.policy(self.X * 50 / self.experiment.scale, self.Y * 50 / self.experiment.scale))
+
+    def Return(self):
+        self.orbit_stat.Record(self.Y)
+        customer = SimClasses.Entity()
+        self.queue.Add(customer)
+
+        self.X += 1
+        self.Y -= 1
+        self.returns_stat.Record(1)
+        self.congestion_stat.Record(max(self.X-self.experiment.server_num*self.experiment.scale/50, 0))
+        self.is_congested_stat.Record(1 if self.X > self.experiment.server_num*self.experiment.scale/50 else 0)
+        self.is_intervening_stat.Record(self.policy(self.X * 50 / self.experiment.scale, self.Y * 50 / self.experiment.scale))
+        self.orbit_stat.Record(self.Y)
+
+        if self.server.Busy < self.experiment.server_num*self.experiment.scale/50:
+            self.server.Seize(1)
+            SimFunctions.Schedule(self.calendar,"EndOfService",SimRNG.Expon(self.experiment.mean_st,2))
+
+    def initialize(self):
+
+        SimFunctions.SimFunctionsInit(self.calendar,self.queues,self.ct_stats,self.dt_stats,self.resources)
+
+        for i in range(self.X):
+            self.queue.Add(SimClasses.Entity())
+            if self.server.Busy < self.experiment.server_num*self.experiment.scale/50:
+                self.server.Seize(1)
+                SimFunctions.Schedule(self.calendar, "EndOfService",
+                                      SimRNG.Expon(self.experiment.mean_st, self.stream))
+                # SimFunctions.Schedule(self.calendar, "EndOfService",
+                #                       SimRNG.Expon(self.experiment.mean_st, self.stream + 2))
+
+        for j in range(self.Y):
+            SimFunctions.Schedule(self.calendar, "Return", SimRNG.Expon(self.experiment.mean_ttr, self.stream))
+            # SimFunctions.Schedule(self.calendar, "Return", SimRNG.Expon(self.experiment.mean_ttr, self.stream + 3))
+
+        self.congestion_stat.Record(max(self.X - self.experiment.server_num*self.experiment.scale/50, 0))
+        self.is_congested_stat.Record(1 if self.X > self.experiment.server_num*self.experiment.scale/50 else 0)
+        self.is_intervening_stat.Record(self.policy(self.X * 50 / self.experiment.scale, self.Y * 50 / self.experiment.scale))
+        self.orbit_stat.Record(self.Y)
+
+        SimFunctions.Schedule(self.calendar, "Arrival", self.NSPP())
+        # SimFunctions.Schedule(self.calendar, "Arrival", SimRNG.Expon(self.experiment.mean_tba / self.experiment.scale * 50, self.stream))
+        # SimFunctions.Schedule(self.calendar, "Arrival", SimRNG.Expon(self.experiment.mean_tba/self.experiment.scale*50, self.stream + 1))
+        SimFunctions.Schedule(self.calendar, "EndSimulation", self.experiment.run_length + self.experiment.warm_up)
+        SimFunctions.Schedule(self.calendar, "ClearIt", self.experiment.warm_up)
+
+    def simulate(self, stream=0):
+        self.stream = stream
+        self.initialize()
+
+        next_event = self.calendar.Remove()
+        SimClasses.Clock = next_event.EventTime
+        while next_event.EventType != "EndSimulation":
+            if next_event.EventType == "Arrival":
+                self.Arrival()
+            elif next_event.EventType == "EndOfService":
+                self.EndOfService()
+            elif next_event.EventType == "Return":
+                self.Return()
+            elif next_event.EventType == "ClearIt":
+                SimFunctions.ClearStats(self.ct_stats, self.dt_stats)
+
+            next_event = self.calendar.Remove()
+            SimClasses.Clock = next_event.EventTime
+
+
+        total_holding_cost = self.experiment.hold_cost * self.congestion_stat.Area
+        total_readmission_cost = self.experiment.return_cost * self.returns_stat.Sum
+        total_intervention_cost = self.interv_cost_stat.Sum
+        avg_intervention = self.interv_stat.Mean()
+        combined_cost = total_holding_cost + total_readmission_cost + total_intervention_cost
+
+        avg_congested_time = self.is_congested_stat.Mean()
+        avg_intervention_time = self.is_intervening_stat.Mean()
+
+
+        return [
+            total_holding_cost / self.experiment.scale * 50,
+            total_readmission_cost / self.experiment.scale * 50,
+            total_intervention_cost / self.experiment.scale * 50,
+            combined_cost / self.experiment.scale * 50,
+            avg_intervention / self.experiment.scale * 50,
+            self.wait_stat.Mean(),
+            self.queue.Mean() / self.experiment.scale * 50,
+            self.orbit_stat.Mean() / self.experiment.scale * 50,
+            self.server.Mean() / self.experiment.scale * 50,
+            self.X,
+            self.Y,
+            avg_congested_time / self.experiment.scale * 50,
+            avg_intervention_time / self.experiment.scale * 50
+        ]
+
+        # AllWaitMean.append(self.wait_stat.Mean())
+        # AllOrbitMean.append(self.orbit_stat.Mean())
+        # AllQueueMean.append(self.queue.Mean())
+        # AllQueueNum.append(self.queue.NumQueue())
+        # AllServerBusyMean.append(self.server.Mean())
+
+def main():
+    hs = [0.05, 0.1, 0.25, 0.5, 1.0]
+    Ms = [0.2, 0.5, 1.0]
+
+    for h, M in product(hs, Ms):
+        exp = Experiment(**{'scale': 50,
+                            'lambda': 9.5 * 2,
+                            'nu': 1 / 15,
+                            'mu': 1 / 4,
+                            'h': h,
+                            'C': "lambda p: 100*{}*(0.2-p)**2".format(M),
+                            'x_0': 25 * 2,
+                            'y_0': 25 * 2,
+                            'reps': 200,
+                            'fluctuation': 0,
+                            'period': 30,
+                            'warm_up': 2000,
+                            'run_length': 2000,
+                            'N': 100
+                            })
+        exp.run()
+        exp.save()        
+
+main()
